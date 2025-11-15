@@ -208,6 +208,31 @@ def reverse_route():
     except Exception as e:
         return jsonify({"status":"error","message":"reverse failed","detail": str(e)}), 200
 
+# return GeoJSON-like array of [lat, lon] points (exterior ring)
+@app.route("/city_outline")
+def city_outline():
+    try:
+        if BOUNDARY_POLY is None:
+            return jsonify({"status":"error","message":"no boundary available"}), 200
+
+        # convert polygon to coordinates list (lat,lng)
+        # Handle multipolygon or polygon
+        try:
+            geom = BOUNDARY_POLY
+            # If multipolygon take unary_union or first polygon
+            if geom.geom_type == "MultiPolygon":
+                poly = list(geom)[0]
+            else:
+                poly = geom
+
+            exterior = list(poly.exterior.coords)  # coords are (lon, lat)
+            coords_latlon = [[lat, lon] for lon, lat in exterior]
+            return jsonify({"status":"ok","outline": coords_latlon}), 200
+        except Exception as e:
+            return jsonify({"status":"error","message":"failed to extract polygon","detail": str(e)}), 200
+
+    except Exception as e:
+        return jsonify({"status":"error","message":"exception","detail": str(e)}), 500
 
 # Routing API used by the map frontend
 @app.route("/route", methods=["GET"])
