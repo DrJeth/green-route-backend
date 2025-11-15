@@ -8,3 +8,4 @@ rtree
 pyproj
 gunicorn
 scikit-learn
+requests

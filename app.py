@@ -1,10 +1,14 @@
-from flask import Flask, render_template, request, jsonify
+# app.py
+from flask import Flask, render_template, request, jsonify, send_from_directory
 import osmnx as ox
 import networkx as nx
 import traceback
 import math
 from shapely.geometry import Point, LineString
 import geopandas as gpd
+import json
+import requests
+import time
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -13,6 +17,35 @@ FORBIDDEN_ROADS = {"primary", "primary_link", "trunk", "trunk_link", "motorway",
 MAX_ALLOW_CROSSING_M = 6        # recommended: allow tiny crossing only (meters)
 ORIGIN_CONNECT_FALLBACK_RADIUS_M = 120  # how far to connect origin to nearest node
 ORIGIN_BOUNDARY_TOL_M = 120     # allow origin to be slightly outside boundary due to GPS noise
+
+# --- Nominatim reverse geocode helper (lightweight HTTP, public Nominatim)
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_USERAGENT = "greenroute-backend/1.0 (contact: you@example.com)"  # replace contact if you want
+
+def reverse_geocode_name(lat, lon, timeout=3):
+    """
+    Attempt a reverse geocode via Nominatim. Return address string or None.
+    Rate-limited friendly: minimal calls and quick timeout.
+    """
+    try:
+        params = {
+            "format": "jsonv2",
+            "lat": float(lat),
+            "lon": float(lon),
+            "zoom": 16,
+            "addressdetails": 0,
+        }
+        headers = {"User-Agent": NOMINATIM_USERAGENT}
+        r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            j = r.json()
+            # prefer display_name
+            return j.get("display_name")
+    except Exception as e:
+        # don't spam logs for reverse failures; print only occasionally
+        # print("Reverse geocode error:", e)
+        return None
+    return None
 
 # --- Load Biñan graph ONCE at startup
 print("Loading Biñan graph (this may take a while the first time)...")
@@ -106,6 +139,25 @@ except Exception as e:
     print("Warning loading boundary polygon:", e)
     BOUNDARY_POLY = None
 
+# --- Prepare CITY_BOUNDARY coordinates for frontend (lat,lon pairs)
+try:
+    if BOUNDARY_POLY is not None:
+        # extract exterior coordinates (lon,lat) -> convert to [lat, lon]
+        exterior = None
+        if hasattr(BOUNDARY_POLY, "geoms"):  # multipolygon
+            # pick the largest polygon's exterior
+            polys = list(BOUNDARY_POLY.geoms)
+            largest = max(polys, key=lambda p: p.area)
+            exterior = list(largest.exterior.coords)
+        else:
+            exterior = list(BOUNDARY_POLY.exterior.coords)
+        CITY_BOUNDARY = [[lat, lon] for lon, lat in exterior]
+    else:
+        CITY_BOUNDARY = []
+except Exception as e:
+    print("City boundary extraction error:", e)
+    CITY_BOUNDARY = []
+
 # --- Clip original graph to Biñan polygon (remove nodes outside) ---
 try:
     if BOUNDARY_POLY is not None:
@@ -133,6 +185,17 @@ print("Applying forbidden-edge filter to clipped graph...")
 G_FILTERED = remove_forbidden_long_edges(G_CLIPPED, max_allow_crossing_m=MAX_ALLOW_CROSSING_M)
 print("Filtered graph ready. Nodes:", len(G_FILTERED.nodes), "Edges:", len(G_FILTERED.edges))
 
+# Serve dashboard UI (if you keep this)
+@app.route("/")
+def index():
+    return render_template("map.html")  # change if you want dashboard_Rider.html
+
+# Serve city boundary as JSON for frontend
+@app.route("/city_boundary")
+def city_boundary():
+    return jsonify({"status":"ok", "boundary": CITY_BOUNDARY}), 200
+
+# Routing API used by the map frontend
 @app.route("/route", methods=["GET"])
 def get_route():
     try:
@@ -152,8 +215,6 @@ def get_route():
             po = Point(origin_lon, origin_lat)
             if not po.within(BOUNDARY_POLY):
                 # allow origin to be slightly outside due to GPS error (tolerance)
-                d_origin = haversine_m(origin_lat, origin_lon, po.y, po.x) if False else None
-                # Instead compute nearest node inside polygon and distance:
                 try:
                     near_node = ox.distance.nearest_nodes(G_FILTERED, origin_lon, origin_lat)
                     near_attr = G_FILTERED.nodes[near_node]
@@ -161,7 +222,6 @@ def get_route():
                     if d > ORIGIN_BOUNDARY_TOL_M:
                         return jsonify({"status":"outside_boundary_origin","message":"Origin is outside Biñan boundary (too far)."}), 200
                     else:
-                        # accept origin but we'll connect via virtual node as usual
                         pass
                 except Exception:
                     return jsonify({"status":"outside_boundary_origin","message":"Origin appears outside Biñan boundary."}), 200
@@ -169,6 +229,7 @@ def get_route():
         print("Boundary check error:", e)
 
     try:
+        print(f"Routing request: origin=({origin_lat},{origin_lon}) -> dest=({dest_lat},{dest_lon})")
         Gf = G_FILTERED.copy()
         dest_node = ox.distance.nearest_nodes(Gf, dest_lon, dest_lat)
 
@@ -285,7 +346,20 @@ def get_route():
                     return jsonify({"status":"no_path","message":"Computed path exits Biñan boundary — rejected for safety."}), 200
 
         route_coords = build_coords_from_path(Gtmp, path, origin_coord=[origin_lat, origin_lon], dest_coord=[dest_lat, dest_lon])
-        return jsonify({"status":"ok","route": route_coords}), 200
+
+        # optional: reverse geocode origin/dest to friendly names (best-effort)
+        origin_name = None
+        dest_name = None
+        try:
+            origin_name = reverse_geocode_name(origin_lat, origin_lon)
+            # small sleep to be polite if needed (avoid hammering public Nominatim)
+            time.sleep(0.2)
+            dest_name = reverse_geocode_name(dest_lat, dest_lon)
+        except Exception:
+            origin_name = None
+            dest_name = None
+
+        return jsonify({"status":"ok","route": route_coords, "origin_name": origin_name, "dest_name": dest_name}), 200
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -294,5 +368,3 @@ def get_route():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-
