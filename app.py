@@ -195,6 +195,20 @@ def index():
 def city_boundary():
     return jsonify({"status":"ok", "boundary": CITY_BOUNDARY}), 200
 
+# city_boundary route
+@app.route("/reverse")
+def reverse_route():
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    if not lat or not lon:
+        return jsonify({"status":"error","message":"missing lat/lon"}), 400
+    try:
+        name = reverse_geocode_name(float(lat), float(lon))
+        return jsonify({"status":"ok","display_name": name}), 200
+    except Exception as e:
+        return jsonify({"status":"error","message":"reverse failed","detail": str(e)}), 200
+
+
 # Routing API used by the map frontend
 @app.route("/route", methods=["GET"])
 def get_route():
