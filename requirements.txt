@@ -7,3 +7,4 @@ shapely
 rtree
 pyproj
 gunicorn
+scikit-learn
