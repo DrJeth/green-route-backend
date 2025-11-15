@@ -1,0 +1,9 @@
+Flask
+flask-cors
+osmnx
+geopandas
+networkx
+shapely
+rtree
+pyproj
+gunicorn
