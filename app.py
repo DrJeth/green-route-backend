@@ -12,6 +12,10 @@ import time
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
+# If CORS issues appear when your mobile app calls the backend, uncomment below:
+# from flask_cors import CORS
+# CORS(app)
+
 # --- Config (tweak if needed)
 FORBIDDEN_ROADS = {"primary", "primary_link", "trunk", "trunk_link", "motorway", "motorway_link"}
 MAX_ALLOW_CROSSING_M = 6        # recommended: allow tiny crossing only (meters)
@@ -20,7 +24,8 @@ ORIGIN_BOUNDARY_TOL_M = 120     # allow origin to be slightly outside boundary d
 
 # --- Nominatim reverse geocode helper (lightweight HTTP, public Nominatim)
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
-NOMINATIM_USERAGENT = "greenroute-backend/1.0 (contact: you@example.com)"  # replace contact if you want
+# IMPORTANT: replace the contact email with your real contact before production
+NOMINATIM_USERAGENT = "greenroute-backend/1.0 (contact: you@example.com)"
 
 def reverse_geocode_name(lat, lon, timeout=3):
     """
@@ -233,6 +238,93 @@ def city_outline():
 
     except Exception as e:
         return jsonify({"status":"error","message":"exception","detail": str(e)}), 500
+
+# --- Simple in-memory cache for geocode (paste here) ---
+GEOCACHE = {}
+GEOCACHE_TTL = 3600  # seconds, 1 hour
+
+def cache_get(key):
+    item = GEOCACHE.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > GEOCACHE_TTL:
+        GEOCACHE.pop(key, None)
+        return None
+    return value
+
+def cache_set(key, value):
+    GEOCACHE[key] = (time.time(), value)
+
+
+# --- Geocode proxy endpoint: /geocode?q=... ---
+# Returns only results inside Biñan polygon (uses viewbox + server-side polygon filtering)
+@app.route("/geocode")
+def geocode_proxy():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"status":"error","message":"missing q parameter"}), 400
+
+    cache_key = f"geocode:{q.lower()}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return jsonify({"status":"ok","results": cached}), 200
+
+    # compute bbox from CITY_BOUNDARY if available (CITY_BOUNDARY is [ [lat, lon], ... ])
+    if CITY_BOUNDARY:
+        lats = [pt[0] for pt in CITY_BOUNDARY]
+        lons = [pt[1] for pt in CITY_BOUNDARY]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+    else:
+        # fallback bbox around Biñan center
+        min_lat, max_lat = 14.26, 14.37
+        min_lon, max_lon = 121.02, 121.12
+
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": 5,
+        "viewbox": f"{min_lon},{max_lat},{max_lon},{min_lat}",
+        "bounded": 1
+    }
+    headers = {"User-Agent": NOMINATIM_USERAGENT}
+
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=4)
+        if r.status_code != 200:
+            # upstream error — return upstream error code
+            return jsonify({"status":"error","message":"upstream geocode failed","code": r.status_code}), 502
+        items = r.json() or []
+    except Exception as e:
+        print("geocode proxy error:", e)
+        return jsonify({"status":"error","message":"geocode failed"}), 500
+
+    results = []
+    for it in items:
+        try:
+            lat = float(it.get("lat"))
+            lon = float(it.get("lon"))
+        except Exception:
+            continue
+
+        # server-side check: must be inside Biñan polygon (if available)
+        if BOUNDARY_POLY is not None:
+            try:
+                if not Point(lon, lat).within(BOUNDARY_POLY):
+                    continue
+            except Exception:
+                continue
+
+        results.append({
+            "display_name": it.get("display_name"),
+            "lat": f"{lat:.6f}",
+            "lon": f"{lon:.6f}"
+        })
+
+    # cache results and return
+    cache_set(cache_key, results)
+    return jsonify({"status":"ok","results": results}), 200
 
 # Routing API used by the map frontend
 @app.route("/route", methods=["GET"])
