@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 import osmnx as ox
 import networkx as nx
 import traceback
@@ -46,9 +46,7 @@ def reverse_geocode_name(lat, lon, timeout=3):
             j = r.json()
             # prefer display_name
             return j.get("display_name")
-    except Exception as e:
-        # don't spam logs for reverse failures; print only occasionally
-        # print("Reverse geocode error:", e)
+    except Exception:
         return None
     return None
 
@@ -147,10 +145,8 @@ except Exception as e:
 # --- Prepare CITY_BOUNDARY coordinates for frontend (lat,lon pairs)
 try:
     if BOUNDARY_POLY is not None:
-        # extract exterior coordinates (lon,lat) -> convert to [lat, lon]
         exterior = None
         if hasattr(BOUNDARY_POLY, "geoms"):  # multipolygon
-            # pick the largest polygon's exterior
             polys = list(BOUNDARY_POLY.geoms)
             largest = max(polys, key=lambda p: p.area)
             exterior = list(largest.exterior.coords)
@@ -190,17 +186,21 @@ print("Applying forbidden-edge filter to clipped graph...")
 G_FILTERED = remove_forbidden_long_edges(G_CLIPPED, max_allow_crossing_m=MAX_ALLOW_CROSSING_M)
 print("Filtered graph ready. Nodes:", len(G_FILTERED.nodes), "Edges:", len(G_FILTERED.edges))
 
-# Serve dashboard UI (if you keep this)
+# ✅ API root (NO HTML needed)
 @app.route("/")
 def index():
-    return render_template("map.html")  # change if you want dashboard_Rider.html
+    return jsonify({
+        "status": "ok",
+        "service": "green-route-backend",
+        "message": "API is running",
+        "endpoints": ["/route", "/city_boundary", "/city_outline", "/geocode", "/reverse"]
+    }), 200
 
 # Serve city boundary as JSON for frontend
 @app.route("/city_boundary")
 def city_boundary():
     return jsonify({"status":"ok", "boundary": CITY_BOUNDARY}), 200
 
-# city_boundary route
 @app.route("/reverse")
 def reverse_route():
     lat = request.args.get("lat")
@@ -213,24 +213,20 @@ def reverse_route():
     except Exception as e:
         return jsonify({"status":"error","message":"reverse failed","detail": str(e)}), 200
 
-# return GeoJSON-like array of [lat, lon] points (exterior ring)
 @app.route("/city_outline")
 def city_outline():
     try:
         if BOUNDARY_POLY is None:
             return jsonify({"status":"error","message":"no boundary available"}), 200
 
-        # convert polygon to coordinates list (lat,lng)
-        # Handle multipolygon or polygon
         try:
             geom = BOUNDARY_POLY
-            # If multipolygon take unary_union or first polygon
             if geom.geom_type == "MultiPolygon":
                 poly = list(geom)[0]
             else:
                 poly = geom
 
-            exterior = list(poly.exterior.coords)  # coords are (lon, lat)
+            exterior = list(poly.exterior.coords)  # (lon, lat)
             coords_latlon = [[lat, lon] for lon, lat in exterior]
             return jsonify({"status":"ok","outline": coords_latlon}), 200
         except Exception as e:
@@ -239,7 +235,7 @@ def city_outline():
     except Exception as e:
         return jsonify({"status":"error","message":"exception","detail": str(e)}), 500
 
-# --- Simple in-memory cache for geocode (paste here) ---
+# --- Simple in-memory cache for geocode ---
 GEOCACHE = {}
 GEOCACHE_TTL = 3600  # seconds, 1 hour
 
@@ -256,9 +252,6 @@ def cache_get(key):
 def cache_set(key, value):
     GEOCACHE[key] = (time.time(), value)
 
-
-# --- Geocode proxy endpoint: /geocode?q=... ---
-# Returns only results inside Biñan polygon (uses viewbox + server-side polygon filtering)
 @app.route("/geocode")
 def geocode_proxy():
     q = (request.args.get("q") or "").strip()
@@ -270,14 +263,12 @@ def geocode_proxy():
     if cached is not None:
         return jsonify({"status":"ok","results": cached}), 200
 
-    # compute bbox from CITY_BOUNDARY if available (CITY_BOUNDARY is [ [lat, lon], ... ])
     if CITY_BOUNDARY:
         lats = [pt[0] for pt in CITY_BOUNDARY]
         lons = [pt[1] for pt in CITY_BOUNDARY]
         min_lat, max_lat = min(lats), max(lats)
         min_lon, max_lon = min(lons), max(lons)
     else:
-        # fallback bbox around Biñan center
         min_lat, max_lat = 14.26, 14.37
         min_lon, max_lon = 121.02, 121.12
 
@@ -293,7 +284,6 @@ def geocode_proxy():
     try:
         r = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=4)
         if r.status_code != 200:
-            # upstream error — return upstream error code
             return jsonify({"status":"error","message":"upstream geocode failed","code": r.status_code}), 502
         items = r.json() or []
     except Exception as e:
@@ -308,7 +298,6 @@ def geocode_proxy():
         except Exception:
             continue
 
-        # server-side check: must be inside Biñan polygon (if available)
         if BOUNDARY_POLY is not None:
             try:
                 if not Point(lon, lat).within(BOUNDARY_POLY):
@@ -322,11 +311,9 @@ def geocode_proxy():
             "lon": f"{lon:.6f}"
         })
 
-    # cache results and return
     cache_set(cache_key, results)
     return jsonify({"status":"ok","results": results}), 200
 
-# Routing API used by the map frontend
 @app.route("/route", methods=["GET"])
 def get_route():
     try:
@@ -337,7 +324,6 @@ def get_route():
     except Exception as e:
         return jsonify({"status":"error","message":"bad parameters","detail": str(e)}), 400
 
-    # Server-side check: destination must be inside Biñan
     try:
         if BOUNDARY_POLY is not None:
             pd = Point(dest_lon, dest_lat)
@@ -345,15 +331,12 @@ def get_route():
                 return jsonify({"status":"outside_boundary","message":"Destination is outside Biñan boundary."}), 200
             po = Point(origin_lon, origin_lat)
             if not po.within(BOUNDARY_POLY):
-                # allow origin to be slightly outside due to GPS error (tolerance)
                 try:
                     near_node = ox.distance.nearest_nodes(G_FILTERED, origin_lon, origin_lat)
                     near_attr = G_FILTERED.nodes[near_node]
                     d = haversine_m(origin_lat, origin_lon, near_attr.get("y"), near_attr.get("x"))
                     if d > ORIGIN_BOUNDARY_TOL_M:
                         return jsonify({"status":"outside_boundary_origin","message":"Origin is outside Biñan boundary (too far)."}), 200
-                    else:
-                        pass
                 except Exception:
                     return jsonify({"status":"outside_boundary_origin","message":"Origin appears outside Biñan boundary."}), 200
     except Exception as e:
@@ -464,7 +447,6 @@ def get_route():
         except nx.NetworkXNoPath:
             return jsonify({"status":"no_path","message":"No path found within e-bike allowed network"}), 200
 
-        # SAFETY CHECK: ensure all nodes in path are inside Biñan polygon
         if BOUNDARY_POLY is not None:
             for node in path:
                 na = Gtmp.nodes[node]
@@ -473,17 +455,14 @@ def get_route():
                 if nxcoord is None or nycoord is None:
                     continue
                 if not Point(nxcoord, nycoord).within(BOUNDARY_POLY):
-                    # found node outside Biñan — reject path
                     return jsonify({"status":"no_path","message":"Computed path exits Biñan boundary — rejected for safety."}), 200
 
         route_coords = build_coords_from_path(Gtmp, path, origin_coord=[origin_lat, origin_lon], dest_coord=[dest_lat, dest_lon])
 
-        # optional: reverse geocode origin/dest to friendly names (best-effort)
         origin_name = None
         dest_name = None
         try:
             origin_name = reverse_geocode_name(origin_lat, origin_lon)
-            # small sleep to be polite if needed (avoid hammering public Nominatim)
             time.sleep(0.2)
             dest_name = reverse_geocode_name(dest_lat, dest_lon)
         except Exception:
